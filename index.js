@@ -10,11 +10,11 @@ const TICK_WINDOW = 1000;
 
 // ─── MARKETS ──────────────────────────────────────────────────────────────────
 const MARKETS = [
-  { symbol:'R_10',   name:'Volatility 10'      },
-  { symbol:'R_25',   name:'Volatility 25'      },
-  { symbol:'R_50',   name:'Volatility 50'      },
-  { symbol:'R_75',   name:'Volatility 75'      },
-  { symbol:'R_100',  name:'Volatility 100'     },
+  { symbol:'R_10',   name:'Volatility 10'       },
+  { symbol:'R_25',   name:'Volatility 25'       },
+  { symbol:'R_50',   name:'Volatility 50'       },
+  { symbol:'R_75',   name:'Volatility 75'       },
+  { symbol:'R_100',  name:'Volatility 100'      },
 ];
 const MARKETS_1S = [
   { symbol:'1HZ10V',  name:'Volatility 10 (1s)' },
@@ -36,17 +36,10 @@ function calcPct(ticks) {
   if (!ticks || ticks.length === 0) return null;
   const counts = Object.fromEntries(DIGITS.map(d => [d, 0]));
   ticks.forEach(t => counts[t % 10]++);
-  const total = ticks.length;
-  return Object.fromEntries(DIGITS.map(d => [d, (counts[d] / total) * 100]));
-}
-function getLastDigit(priceStr, pip) {
-  const parts = String(priceStr).split('.');
-  if (parts.length === 1) return 0;
-  const decimals = parts[1].padEnd(pip, '0');
-  return parseInt(decimals[pip - 1]) || 0;
+  return Object.fromEntries(DIGITS.map(d => [d, (counts[d] / ticks.length) * 100]));
 }
 
-// ─── BOT DEFINITIONS ──────────────────────────────────────────────────────────
+// ─── BOTS ─────────────────────────────────────────────────────────────────────
 const BOTS = [
   {
     id:1, name:'OVER BOT 1', markets: MARKETS,
@@ -64,10 +57,7 @@ const BOTS = [
       return [0,1,2].every(d=>pct[d]<9.5) && [0,1,2].some(d=>pct[d]===min);
     },
   },
-  {
-    id:3, name:'Phantom U9', markets: MARKETS,
-    eval() { return false; }, // WIP
-  },
+  { id:3, name:'Phantom U9', markets: MARKETS, eval() { return false; } },
   {
     id:4, name:'VIET X1', markets: MARKETS,
     eval(pct) {
@@ -111,55 +101,152 @@ const BOTS = [
 ];
 
 // ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-function sendTelegram(message) {
-  const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
-  const options = {
-    hostname: 'api.telegram.org',
-    path: `/bot${BOT_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-  };
-  const req = https.request(options, res => {
-    res.on('data', () => {});
+function telegramRequest(method, body) {
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    };
+    const req = https.request(options, res => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.write(data);
+    req.end();
   });
-  req.on('error', e => console.error('Telegram error:', e.message));
-  req.write(body);
-  req.end();
 }
 
-// ─── MARKET STATE ─────────────────────────────────────────────────────────────
-const state = {};
-ALL_MARKETS.forEach(m => {
-  state[m.symbol] = { ticks: [], pct: null, pip: null };
-});
+async function sendMessage(text) {
+  const res = await telegramRequest('sendMessage', { chat_id: CHAT_ID, text, parse_mode: 'HTML' });
+  return res?.result?.message_id || null;
+}
 
-const prevSignals = {};
+async function editMessage(messageId, text) {
+  await telegramRequest('editMessageText', { chat_id: CHAT_ID, message_id: messageId, text, parse_mode: 'HTML' });
+}
 
-// ─── CHECK ALL BOTS ───────────────────────────────────────────────────────────
+async function deleteMessage(messageId) {
+  await telegramRequest('deleteMessage', { chat_id: CHAT_ID, message_id: messageId });
+}
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+const marketState = {};
+ALL_MARKETS.forEach(m => { marketState[m.symbol] = { ticks: [], pct: null, pip: null }; });
+
+// Track active signals: { botId_symbol: { marketName, redDigit, pct } }
+const activeSignals = {};
+let signalMessageId = null;
+let updateScheduled = false;
+
+// ─── BUILD MESSAGE ────────────────────────────────────────────────────────────
+function buildSignalMessage() {
+  const entries = Object.entries(activeSignals);
+  if (entries.length === 0) return null;
+
+  let msg = `🟢 <b>VIKIHUB ACTIVE SIGNALS</b>\n`;
+  msg += `🕐 ${new Date().toLocaleTimeString()}\n`;
+  msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+  // Group by bot
+  const byBot = {};
+  entries.forEach(([key, val]) => {
+    const botId = parseInt(key.split('_')[0]);
+    if (!byBot[botId]) byBot[botId] = [];
+    byBot[botId].push(val);
+  });
+
+  Object.entries(byBot).forEach(([botId, signals]) => {
+    const bot = BOTS.find(b => b.id === parseInt(botId));
+    msg += `📌 <b>${bot.name}</b>\n`;
+    signals.forEach(s => {
+      msg += `   📊 ${s.marketName}\n`;
+      msg += `   🔴 Red: D${s.redDigit} @ ${s.redPct}%\n`;
+    });
+    msg += '\n';
+  });
+
+  return msg;
+}
+
+// ─── UPDATE SIGNAL MESSAGE ────────────────────────────────────────────────────
+async function updateSignalMessage() {
+  updateScheduled = false;
+  const msg = buildSignalMessage();
+
+  if (!msg) {
+    // No active signals — delete message
+    if (signalMessageId) {
+      await deleteMessage(signalMessageId);
+      signalMessageId = null;
+      console.log('[MSG] Signal cleared — message deleted');
+    }
+    return;
+  }
+
+  if (signalMessageId) {
+    // Edit existing message
+    await editMessage(signalMessageId, msg);
+    console.log('[MSG] Signal message updated');
+  } else {
+    // Send new message
+    signalMessageId = await sendMessage(msg);
+    console.log('[MSG] New signal message sent:', signalMessageId);
+  }
+}
+
+function scheduleUpdate() {
+  if (!updateScheduled) {
+    updateScheduled = true;
+    setTimeout(updateSignalMessage, 1500); // debounce 1.5s
+  }
+}
+
+// ─── CHECK BOTS ───────────────────────────────────────────────────────────────
 function checkBots() {
+  let changed = false;
+
   BOTS.forEach(bot => {
     bot.markets.forEach(market => {
-      const s = state[market.symbol];
+      const s = marketState[market.symbol];
       if (!s.pct) return;
       const signal = bot.eval(s.pct);
-      const key = `${bot.id}-${market.symbol}`;
-      if (signal && !prevSignals[key]) {
+      const key = `${bot.id}_${market.symbol}`;
+
+      if (signal && !activeSignals[key]) {
         const min = getMin(s.pct);
         const redDigit = DIGITS.find(d => s.pct[d] === min);
-        const msg =
-          `🟢 <b>${bot.name} — TRADE NOW</b>\n` +
-          `📊 Market: <b>${market.name}</b>\n` +
-          `🔴 Red digit: D${redDigit} @ ${s.pct[redDigit].toFixed(1)}%\n` +
-          `⏰ ${new Date().toLocaleTimeString()}`;
-        sendTelegram(msg);
-        console.log(`[SIGNAL] ${bot.name} → ${market.name}`);
+        activeSignals[key] = {
+          marketName: market.name,
+          redDigit,
+          redPct: s.pct[redDigit].toFixed(1),
+        };
+        console.log(`[SIGNAL ON] ${bot.name} → ${market.name}`);
+        changed = true;
+      } else if (!signal && activeSignals[key]) {
+        delete activeSignals[key];
+        console.log(`[SIGNAL OFF] ${bot.name} → ${market.name}`);
+        changed = true;
+      } else if (signal && activeSignals[key]) {
+        // Update red digit % in case it changed
+        const min = getMin(s.pct);
+        const redDigit = DIGITS.find(d => s.pct[d] === min);
+        activeSignals[key].redDigit = redDigit;
+        activeSignals[key].redPct = s.pct[redDigit].toFixed(1);
       }
-      prevSignals[key] = signal;
     });
   });
+
+  if (changed) scheduleUpdate();
 }
 
-// ─── WEBSOCKET PER MARKET ─────────────────────────────────────────────────────
+// ─── WEBSOCKET ────────────────────────────────────────────────────────────────
 function connectMarket(market) {
   const ws = new WebSocket(WS_URL);
 
@@ -179,27 +266,27 @@ function connectMarket(market) {
       const firstPrice = priceStrings.find(p => p.includes('.')) || priceStrings[0];
       const dotIdx = firstPrice.indexOf('.');
       const pip = dotIdx === -1 ? 0 : firstPrice.length - dotIdx - 1;
-      state[market.symbol].pip = pip;
+      marketState[market.symbol].pip = pip;
       const ticks = priceStrings.map(p => {
         const parts = p.split('.');
         if (parts.length === 1 || pip === 0) return 0;
         return parseInt(parts[1][pip-1] || '0') || 0;
       }).slice(-TICK_WINDOW);
-      state[market.symbol].ticks = ticks;
-      state[market.symbol].pct = calcPct(ticks);
+      marketState[market.symbol].ticks = ticks;
+      marketState[market.symbol].pct = calcPct(ticks);
       checkBots();
     }
 
     if (data.msg_type === 'tick') {
       const quoteMatch = rawStr.match(/"quote":([\d.]+)/);
       if (!quoteMatch) return;
-      const pip = state[market.symbol].pip;
+      const pip = marketState[market.symbol].pip;
       if (pip == null) return;
       const parts = quoteMatch[1].split('.');
       const lastDigit = parts.length === 1 ? 0 : parseInt(parts[1][pip-1] || '0') || 0;
-      const ticks = [...state[market.symbol].ticks, lastDigit].slice(-TICK_WINDOW);
-      state[market.symbol].ticks = ticks;
-      state[market.symbol].pct = calcPct(ticks);
+      const ticks = [...marketState[market.symbol].ticks, lastDigit].slice(-TICK_WINDOW);
+      marketState[market.symbol].ticks = ticks;
+      marketState[market.symbol].pct = calcPct(ticks);
       checkBots();
     }
   });
@@ -209,24 +296,18 @@ function connectMarket(market) {
     setTimeout(() => connectMarket(market), 3000);
   });
 
-  ws.on('error', (e) => {
-    console.error(`[WS] Error on ${market.name}:`, e.message);
-    ws.terminate();
-  });
+  ws.on('error', (e) => { console.error(`[WS] Error: ${market.name}:`, e.message); ws.terminate(); });
 
-  // Resync every 3 minutes
   setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws.readyState === WebSocket.OPEN)
       ws.send(JSON.stringify({ ticks_history: market.symbol, count: 1000, end: 'latest', style: 'ticks' }));
-    }
   }, 3 * 60 * 1000);
 }
 
 // ─── START ────────────────────────────────────────────────────────────────────
-console.log('🚀 VIKIHUB Volatility Signal Bot starting...');
-sendTelegram('🚀 <b>VIKIHUB Signal Bot is now ONLINE</b>\nMonitoring all markets 24/7...');
+console.log('🚀 VIKIHUB Signal Bot starting...');
+sendMessage('🚀 <b>VIKIHUB Signal Bot is ONLINE</b>\nMonitoring all markets 24/7...');
 ALL_MARKETS.forEach(connectMarket);
 
-// Keep Railway happy with a simple HTTP server
 const http = require('http');
 http.createServer((req, res) => res.end('VIKIHUB Bot Running')).listen(process.env.PORT || 3000);
