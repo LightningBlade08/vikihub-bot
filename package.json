@@ -1,0 +1,12 @@
+{
+  "name": "vikihub-signal-bot",
+  "version": "1.0.0",
+  "description": "VIKIHUB Volatility Signal Telegram Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
